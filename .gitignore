@@ -1,0 +1,33 @@
+# Binaries
+log-processor
+log-processor-go
+*.exe
+*.out
+
+# Build artifacts
+dist/
+build/
+
+# Config with secrets
+config.json
+
+# Environment files
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go test cache
+*.test
+*.prof
+
+# Go vendor (if not committed)
+# vendor/

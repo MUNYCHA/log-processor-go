@@ -1,0 +1,31 @@
+[Unit]
+Description=Log Processor Service
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=munycha-ubuntu26-wsl
+WorkingDirectory=/opt/log-processor-go
+
+ExecStart=/opt/log-processor-go/log-processor-go \
+  --config=/etc/log-processor-go/config.json
+
+Restart=on-failure
+RestartSec=5
+StartLimitAction=none
+
+TimeoutStopSec=50
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=log-processor
+
+LimitNOFILE=65536
+MemoryHigh=64M
+MemoryMax=128M
+MemorySwapMax=0
+
+[Install]
+WantedBy=multi-user.target

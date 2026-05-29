@@ -1,0 +1,22 @@
+{
+  "bootstrapServers": "",
+
+  "telegramBotToken": "",
+  "telegramChatId": "",
+
+  "topics": [
+    {
+      "topic": "app1-topic",
+      "output": "/data/logs/received_app1.log",
+      "alertKeywords": [
+        "FATAL",
+        "PANIC",
+        "deadlock",
+        "terminating connection",
+        "could not"
+      ],
+      "patternStoreFile": "",
+      "patternExtractRestrictMode": "high"
+    }
+  ]
+}
