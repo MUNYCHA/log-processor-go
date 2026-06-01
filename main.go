@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/IBM/sarama"
 	"log-processor-go/config"
+	"log-processor-go/health"
 	"log-processor-go/kafka"
 	"log-processor-go/logpkg"
 	"log-processor-go/notification"
@@ -19,10 +21,11 @@ import (
 )
 
 const (
-	consumerGroupID        = "file-log-consumer"
-	telegramQueueCapacity  = 1000
-	consumerShutdownWait   = 15 * time.Second
-	telegramDrainWait      = 30 * time.Second
+	consumerGroupID       = "file-log-consumer"
+	telegramQueueCapacity = 1000
+	consumerShutdownWait  = 15 * time.Second
+	telegramDrainWait     = 30 * time.Second
+	healthAddr            = ":8080"
 )
 
 func main() {
@@ -52,12 +55,21 @@ func main() {
 
 	saramaConfig := kafka.NewSaramaConfig()
 
-	var consumerWg sync.WaitGroup
-	type consumerHandle struct {
-		cg     sarama.ConsumerGroup
-		cancel context.CancelFunc
+	tracker := health.NewReadinessTracker(len(cfg.Topics))
+
+	healthSrv := &http.Server{
+		Addr:    healthAddr,
+		Handler: newHealthMux(tracker),
 	}
-	handles := make([]consumerHandle, 0, len(cfg.Topics))
+	go func() {
+		slog.Info("health server listening", "addr", healthAddr)
+		if err := healthSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("health server error", "error", err)
+		}
+	}()
+
+	var consumerWg sync.WaitGroup
+	cancels := make([]context.CancelFunc, 0, len(cfg.Topics))
 
 	for i := range cfg.Topics {
 		t := &cfg.Topics[i]
@@ -72,29 +84,17 @@ func main() {
 		topicCtx := &kafka.TopicContext{Topic: t.Topic, Handler: handler, Writer: writer}
 		loop := kafka.NewPollLoop(topicCtx, formatter, telegramCh)
 
-		cg, err := sarama.NewConsumerGroup([]string{cfg.BootstrapServers}, consumerGroupID, saramaConfig)
-		if err != nil {
-			slog.Error("failed to create consumer group", "topic", t.Topic, "error", err)
-			os.Exit(1)
-		}
-
 		ctx, cancel := context.WithCancel(context.Background())
-		handles = append(handles, consumerHandle{cg: cg, cancel: cancel})
+		cancels = append(cancels, cancel)
 
+		brokers := cfg.BootstrapServers
 		topic := t.Topic
+		idx := i
+
 		consumerWg.Add(1)
 		go func() {
 			defer consumerWg.Done()
-			defer cg.Close()
-			for {
-				if err := cg.Consume(ctx, []string{topic}, loop); err != nil {
-					slog.Error("consumer group error", "topic", topic, "error", err)
-					return
-				}
-				if ctx.Err() != nil {
-					return
-				}
-			}
+			runConsumer(ctx, brokers, topic, loop, saramaConfig, tracker, idx)
 		}()
 	}
 
@@ -114,8 +114,8 @@ func main() {
 
 	slog.Info("shutdown signal received, stopping poll loops...")
 
-	for _, h := range handles {
-		h.cancel()
+	for _, cancel := range cancels {
+		cancel()
 	}
 
 	done := make(chan struct{})
@@ -137,7 +137,54 @@ func main() {
 		slog.Warn("Telegram sender did not drain in time")
 	}
 
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutCancel()
+	_ = healthSrv.Shutdown(shutCtx)
+
 	slog.Info("shutdown complete")
+}
+
+// runConsumer owns the full consumer group lifecycle for one topic.
+// It retries the initial connection and any mid-run disconnects using
+// exponential backoff, marking the health tracker accordingly.
+func runConsumer(
+	ctx context.Context,
+	brokers, topic string,
+	loop sarama.ConsumerGroupHandler,
+	cfg *sarama.Config,
+	tracker *health.ReadinessTracker,
+	idx int,
+) {
+	cg, err := kafka.NewConsumerGroupWithRetry(ctx, []string{brokers}, consumerGroupID, cfg)
+	if err != nil {
+		return // ctx cancelled during startup retry
+	}
+	tracker.MarkReady(idx)
+
+	for {
+		if err := cg.Consume(ctx, []string{topic}, loop); err != nil {
+			slog.Error("consumer error, reconnecting", "topic", topic, "error", err)
+			tracker.MarkNotReady(idx)
+			cg.Close()
+
+			cg, err = kafka.NewConsumerGroupWithRetry(ctx, []string{brokers}, consumerGroupID, cfg)
+			if err != nil {
+				return // ctx cancelled during reconnect retry
+			}
+			tracker.MarkReady(idx)
+			continue
+		}
+		if ctx.Err() != nil {
+			cg.Close()
+			return
+		}
+	}
+}
+
+func newHealthMux(tracker *health.ReadinessTracker) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/healthz", tracker)
+	return mux
 }
 
 func buildHandler(t *config.TopicConfig) (*pipeline.LogHandler, error) {
