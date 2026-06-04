@@ -29,3 +29,10 @@ func (r *ReadinessTracker) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	}
 	fmt.Fprintln(w, "ok")
 }
+
+// Live is a liveness handler: it returns 200 as long as the process is
+// running. Unlike readiness, it does not depend on Kafka connectivity, so a
+// supervisor won't kill a healthy process that is merely waiting to reconnect.
+func Live(w http.ResponseWriter, _ *http.Request) {
+	fmt.Fprintln(w, "alive")
+}

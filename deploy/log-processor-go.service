@@ -12,18 +12,22 @@ WorkingDirectory=/opt/log-processor-go
 ExecStart=/opt/log-processor-go/log-processor-go \
   --config=/etc/log-processor-go/config.json
 
+# Soft heap target so the Go GC works to stay below the cgroup hard cap
+# (MemoryMax) instead of letting RSS climb into an OOM kill.
+Environment=GOMEMLIMIT=112MiB
+
 Restart=on-failure
 RestartSec=5
 StartLimitAction=none
 
-TimeoutStopSec=50
+TimeoutStopSec=60
 
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=log-processor
 
 LimitNOFILE=65536
-MemoryHigh=64M
+MemoryHigh=96M
 MemoryMax=128M
 MemorySwapMax=0
 

@@ -2,11 +2,13 @@ package logpkg
 
 import (
 	"bufio"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -23,6 +25,20 @@ type AlertPatternStore struct {
 	patternFile string
 	mu          sync.RWMutex
 	known       map[string]struct{}
+	disabled    atomic.Bool
+}
+
+// Disabled reports whether dedup has been turned off for this run (because the
+// pattern file became unwritable). When disabled, callers should send every
+// alert rather than suppress.
+func (s *AlertPatternStore) Disabled() bool { return s.disabled.Load() }
+
+// disable turns dedup off for the rest of the run, logging once on transition.
+func (s *AlertPatternStore) disable(reason string, err error) {
+	if s.disabled.CompareAndSwap(false, true) {
+		slog.Error("pattern file not writable — dedup disabled for this run, all alerts will be sent",
+			"file", s.patternFile, "reason", reason, "error", err)
+	}
 }
 
 func NewAlertPatternStore(patternFile string) (*AlertPatternStore, error) {
@@ -106,15 +122,17 @@ func (s *AlertPatternStore) Add(pattern string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	f, err := os.OpenFile(s.patternFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
+	// No O_CREATE: the app never creates the pattern file. If it is missing or
+	// unwritable, dedup disables itself (below) and all alerts are sent.
+	f, err := os.OpenFile(s.patternFile, os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		slog.Error("failed to open pattern file for append", "file", s.patternFile, "error", err)
+		s.disable("open for append failed", err)
 		return false
 	}
 	_, writeErr := f.WriteString(pattern + "\n")
 	closeErr := f.Close()
 	if writeErr != nil || closeErr != nil {
-		slog.Error("failed to persist alert pattern", "file", s.patternFile, "write", writeErr, "close", closeErr)
+		s.disable("persist failed", errors.Join(writeErr, closeErr))
 		return false
 	}
 

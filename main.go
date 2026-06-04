@@ -21,12 +21,18 @@ import (
 )
 
 const (
-	consumerGroupID       = "file-log-consumer"
-	telegramQueueCapacity = 1000
-	consumerShutdownWait  = 15 * time.Second
-	telegramDrainWait     = 30 * time.Second
-	healthAddr            = ":8080"
+	telegramQueueCapacity    = 1000
+	consumerShutdownWait     = 15 * time.Second
+	telegramDrainWait        = 30 * time.Second
+	telegramDisabledReminder = 5 * time.Minute
+	healthAddr               = ":8080"
 )
+
+// consumerGroupID is unique per process start so the consumer always begins at
+// the newest offset (no committed offsets to resume from) on both the initial
+// connect and every reconnect. This skips any backlog that accumulated during a
+// Kafka outage instead of replaying it — keeping memory flat through recovery.
+var consumerGroupID = fmt.Sprintf("file-log-consumer-%d", time.Now().UnixNano())
 
 func main() {
 	cfg, path, err := config.Load(os.Args[1:])
@@ -51,6 +57,12 @@ func main() {
 	formatter := notification.NewTelegramAlertFormatter()
 	notifier := notification.NewTelegramNotificationService(cfg.TelegramBotToken, cfg.TelegramChatId)
 
+	// Telegram is best-effort: if it is unreachable at startup, disable alert
+	// sending for the rest of the run rather than blocking on every send.
+	if err := notifier.Probe(); err != nil {
+		notifier.Disable(err)
+	}
+
 	telegramCh := make(chan *logpkg.LogEvent, telegramQueueCapacity)
 
 	saramaConfig := kafka.NewSaramaConfig()
@@ -74,11 +86,7 @@ func main() {
 	for i := range cfg.Topics {
 		t := &cfg.Topics[i]
 
-		handler, err := buildHandler(t)
-		if err != nil {
-			slog.Error("failed to build handler", "topic", t.Topic, "error", err)
-			os.Exit(1)
-		}
+		handler := buildHandler(t)
 
 		writer := pipeline.NewBatchFileWriter(t.Output)
 		topicCtx := &kafka.TopicContext{Topic: t.Topic, Handler: handler, Writer: writer}
@@ -103,7 +111,17 @@ func main() {
 	telegramWg.Add(1)
 	go func() {
 		defer telegramWg.Done()
+		var lastReminder time.Time
 		for event := range telegramCh {
+			if notifier.Disabled() {
+				// Drain and discard so the queue can't back up; remind only
+				// occasionally that alerting is off.
+				if time.Since(lastReminder) >= telegramDisabledReminder {
+					lastReminder = time.Now()
+					slog.Warn("telegram disabled — dropping alerts for this run")
+				}
+				continue
+			}
 			notifier.Send(formatter.Format(event))
 		}
 	}()
@@ -160,6 +178,7 @@ func runConsumer(
 		return // ctx cancelled during startup retry
 	}
 	tracker.MarkReady(idx)
+	go logConsumerErrors(ctx, cg, topic)
 
 	for {
 		if err := cg.Consume(ctx, []string{topic}, loop); err != nil {
@@ -172,6 +191,7 @@ func runConsumer(
 				return // ctx cancelled during reconnect retry
 			}
 			tracker.MarkReady(idx)
+			go logConsumerErrors(ctx, cg, topic)
 			continue
 		}
 		if ctx.Err() != nil {
@@ -181,13 +201,31 @@ func runConsumer(
 	}
 }
 
+// logConsumerErrors drains a consumer group's error channel so transient
+// broker/partition errors are visible. The channel is closed by cg.Close(),
+// which ends this goroutine; ctx guards against leaks during shutdown.
+func logConsumerErrors(ctx context.Context, cg sarama.ConsumerGroup, topic string) {
+	for {
+		select {
+		case err, ok := <-cg.Errors():
+			if !ok {
+				return
+			}
+			slog.Error("consumer group error", "topic", topic, "error", err)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 func newHealthMux(tracker *health.ReadinessTracker) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", tracker)
+	mux.HandleFunc("/livez", health.Live)
 	return mux
 }
 
-func buildHandler(t *config.TopicConfig) (*pipeline.LogHandler, error) {
+func buildHandler(t *config.TopicConfig) *pipeline.LogHandler {
 	var rules []logpkg.NormalizerRule
 	if t.HasCustomNormalizationRules() {
 		for _, r := range t.CustomNormalizationRules {
@@ -210,25 +248,28 @@ func buildHandler(t *config.TopicConfig) (*pipeline.LogHandler, error) {
 
 	var store *logpkg.AlertPatternStore
 	if t.HasPatternStore() {
-		var err error
-		store, err = logpkg.NewAlertPatternStore(t.PatternStoreFile)
+		s, err := logpkg.NewAlertPatternStore(t.PatternStoreFile)
 		if err != nil {
-			return nil, err
+			// Pattern dedup is best-effort: if the store can't be loaded, run
+			// without it (every detected alert is sent) rather than refusing to
+			// start. The file is never created by the app.
+			slog.Error("pattern store unavailable — dedup disabled for this topic, all alerts will be sent",
+				"topic", t.Topic, "file", t.PatternStoreFile, "error", err)
+		} else {
+			store = s
 		}
 	}
 
-	return pipeline.NewLogHandler(detector, normalizer, store), nil
+	return pipeline.NewLogHandler(detector, normalizer, store)
 }
 
 func validatePaths(t *config.TopicConfig) error {
 	if err := checkWritableFile(t.Output); err != nil {
 		return fmt.Errorf("output file: %w", err)
 	}
-	if t.HasPatternStore() {
-		if err := checkWritableFile(t.PatternStoreFile); err != nil {
-			return fmt.Errorf("pattern store file: %w", err)
-		}
-	}
+	// The pattern store file is intentionally not validated here: if it is
+	// missing or unwritable, the store disables dedup at runtime (see
+	// buildHandler / AlertPatternStore) instead of blocking startup.
 	return nil
 }
 

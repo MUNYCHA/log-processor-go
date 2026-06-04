@@ -7,17 +7,20 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
 // TelegramNotificationService sends messages to a Telegram chat.
-// Not safe for concurrent use — intended to be driven by a single goroutine.
+// Send is not safe for concurrent use — it is intended to be driven by a single
+// goroutine. The disabled flag is atomic so it can be read from elsewhere.
 type TelegramNotificationService struct {
 	botToken        string
 	chatId          string
 	lastSend        time.Time
 	minSendInterval time.Duration
 	client          *http.Client
+	disabled        atomic.Bool
 }
 
 const (
@@ -37,12 +40,43 @@ func NewTelegramNotificationService(botToken, chatId string) *TelegramNotificati
 	}
 }
 
+// Disabled reports whether alert sending has been turned off for this run.
+func (t *TelegramNotificationService) Disabled() bool { return t.disabled.Load() }
+
+// Disable turns off alert sending for the rest of the run, logging once on the
+// transition. Subsequent calls are no-ops. Used when Telegram is unreachable at
+// startup or a live send fails on a connectivity error.
+func (t *TelegramNotificationService) Disable(err error) {
+	if t.disabled.CompareAndSwap(false, true) {
+		slog.Error("telegram unreachable — alert sending disabled for this run", "error", err)
+	}
+}
+
+// Probe checks Telegram reachability once (via getMe). Returns an error if the
+// endpoint cannot be reached or rejects the token.
+func (t *TelegramNotificationService) Probe() error {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/getMe", t.botToken)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("telegram getMe returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (t *TelegramNotificationService) Send(message string) {
 	t.enforceRateLimit()
 
 	for i := 1; i <= maxRetries; i++ {
 		retryAfter, err := t.sendRequest(message)
-
 		if err == nil {
 			t.lastSend = time.Now()
 			t.minSendInterval = baseSendInterval
@@ -50,23 +84,25 @@ func (t *TelegramNotificationService) Send(message string) {
 		}
 
 		if retryAfter > 0 {
+			// Reachable but rate-limited: back off and retry; don't disable.
 			t.minSendInterval = min(t.minSendInterval*2, maxSendInterval)
-			slog.Warn("telegram 429 rate-limited",
-				"retry_after_s", retryAfter, "new_interval_s", t.minSendInterval.Seconds())
 			time.Sleep(time.Duration(retryAfter) * time.Second)
 			continue
 		}
 
-		// timeout
-		slog.Warn("telegram timeout", "attempt", i, "max", maxRetries)
-		if i == maxRetries {
-			slog.Error("telegram FAILED after timeouts, alert dropped", "attempts", maxRetries)
-			return
+		// Connectivity failure (timeout / refused / DNS). Retry a couple times,
+		// then treat Telegram as down and disable for the rest of the run.
+		if i < maxRetries {
+			time.Sleep(time.Second)
+			continue
 		}
-		time.Sleep(time.Second)
+		t.Disable(err)
+		return
 	}
 
-	slog.Error("telegram FAILED after max retries (persistent 429), alert dropped", "attempts", maxRetries)
+	// Loop exhausted on persistent 429s: Telegram is reachable, just throttled —
+	// drop this alert but keep alerting enabled.
+	slog.Warn("telegram persistently rate-limited, alert dropped")
 }
 
 func (t *TelegramNotificationService) enforceRateLimit() {

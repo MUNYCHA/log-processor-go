@@ -52,16 +52,16 @@ func (h *LogHandler) ProcessAlert(event *logpkg.LogEvent) *logpkg.LogEvent {
 		return nil
 	}
 
-	if h.patternStore != nil {
+	if h.patternStore != nil && !h.patternStore.Disabled() {
 		pattern := h.normalizer.NormalizeMessage(event.Message)
 		if h.patternStore.IsKnown(pattern) {
 			slog.Debug("suppressed telegram: pattern already known", "pattern", pattern)
 			return nil
 		}
 		if !h.patternStore.Add(pattern) {
-			slog.Error("telegram suppressed: could not persist new alert pattern",
-				"topic", event.Topic, "server", event.ServerName)
-			return nil
+			// Add failed and has disabled the store; send the alert instead of
+			// suppressing it. Further alerts skip dedup entirely.
+			return event
 		}
 	}
 
