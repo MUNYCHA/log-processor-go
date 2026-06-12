@@ -178,6 +178,7 @@ func runConsumer(
 		return // ctx cancelled during startup retry
 	}
 	tracker.MarkReady(idx)
+	slog.Info("connected to kafka", "topic", topic)
 	go logConsumerErrors(ctx, cg, topic)
 
 	for {
@@ -191,6 +192,7 @@ func runConsumer(
 				return // ctx cancelled during reconnect retry
 			}
 			tracker.MarkReady(idx)
+			slog.Info("reconnected to kafka", "topic", topic)
 			go logConsumerErrors(ctx, cg, topic)
 			continue
 		}
