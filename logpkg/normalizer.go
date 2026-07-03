@@ -41,6 +41,10 @@ var (
 		regexp2.MustCompile(`\$\$Lambda\$\d+/0x[0-9a-fA-F]+`, 0),
 		// 8. UUID
 		regexp2.MustCompile(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`, 0),
+		// 8b. JWT / bearer token — "eyJ" is base64 for `{"`, so every JWT
+		// starts with it. Must run before the hex/number rules shred the
+		// dot-separated segments into fragments.
+		regexp2.MustCompile(`\beyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{4,}(?:\.[A-Za-z0-9_\-]*)?`, 0),
 		// 9. MAC address (before 0xHEX so colon-joined pairs are recognised first)
 		regexp2.MustCompile(`\b(?:[0-9a-fA-F]{2}[:\-]){5}[0-9a-fA-F]{2}\b`, 0),
 		// 9b. IPv6 — full 8-group form or compressed with "::". Must run here,
@@ -59,16 +63,26 @@ var (
 		regexp2.MustCompile(`\b[A-Za-z]:\\[\w\\.\\-]+`, 0),
 		// 14. Unix path (negative lookbehind prevents matching after a word char or <)
 		regexp2.MustCompile(`(?<![\w<])/(?:[\w.\-]+/)+[\w.\-]*`, 0),
-		// 15. Date only: YYYY-MM-DD or YYYY/MM/DD
-		regexp2.MustCompile(`\b\d{4}[-/]\d{2}[-/]\d{2}\b`, 0),
+		// 14b. Single-segment Unix path: /data, /health. Rule 14 needs two
+		// segments; the same lookbehind still blocks and/or, I/O, HTTP/1.1.
+		regexp2.MustCompile(`(?<![\w<])/[\w.\-]{2,}`, 0),
+		// 14c. Semantic version: v2.14.3, 1.8.22-rc1. After the IP and path
+		// rules so 1.2.3.4 stays <IP> and /app-1.2.3/lib stays one <PATH>.
+		regexp2.MustCompile(`\bv?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z.\-]*)?\b`, 0),
+		// 15. Date only: YYYY-MM-DD or YYYY/M/D (day/month may be unpadded)
+		regexp2.MustCompile(`\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b`, 0),
 		// 16. Time only: HH:MM:SS(.ms)
 		regexp2.MustCompile(`\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\b`, 0),
-		// 17. Bare hex 8+ chars — requires at least one digit AND one letter
-		regexp2.MustCompile(`\b(?=[0-9a-fA-F]*\d)(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{8,}\b`, 0),
+		// 16b. Time without seconds: HH:MM (16 already took HH:MM:SS; the
+		// lookahead keeps H:M:S leftovers and ratios like 3:1 untouched)
+		regexp2.MustCompile(`\b\d{1,2}:\d{2}\b(?!:\d)`, 0),
+		// 17. Bare hex 7+ chars (short git SHA and up) — requires at least
+		// one digit AND one letter so plain words and plain numbers survive
+		regexp2.MustCompile(`\b(?=[0-9a-fA-F]*\d)(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{7,}\b`, 0),
 		// 18. Size with unit
 		regexp2.MustCompile(`\b\d+(?:\.\d+)?(?:KB|MB|GB|TB|KiB|MiB|GiB|TiB|B)\b`, 0),
-		// 19. Duration with unit
-		regexp2.MustCompile(`\b\d+(?:\.\d+)?(?:ns|us|ms|s|m|h|d)\b`, 0),
+		// 19. Duration with unit, including compound forms like 1h30m
+		regexp2.MustCompile(`\b(?:\d+(?:\.\d+)?(?:ns|us|ms|s|m|h|d))+\b`, 0),
 		// 20. Percent
 		regexp2.MustCompile(`\b\d+(?:\.\d+)?%`, 0),
 		// 21. Bare number — negative lookbehind prevents matching inside identifiers
@@ -86,6 +100,7 @@ var (
 		"(<FILE>:<LINE>)",    // 6
 		"$$Lambda$<N>/<HEX>", // 7  (literal output — contains $ signs)
 		"<UUID>",             // 8
+		"<JWT>",              // 8b
 		"<MAC>",              // 9
 		"<IP6>",              // 9b
 		"<HEX>",              // 10
@@ -93,8 +108,11 @@ var (
 		"<IP>",               // 12
 		"<PATH>",             // 13
 		"<PATH>",             // 14
+		"<PATH>",             // 14b
+		"<VER>",              // 14c
 		"<TS>",               // 15
 		"<TS>",               // 16
+		"<TS>",               // 16b
 		"<HEX>",              // 17
 		"<SIZE>",             // 18
 		"<DUR>",              // 19

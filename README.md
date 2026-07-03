@@ -202,19 +202,21 @@ Variable tokens in log messages are replaced with structural placeholders before
 
 | Category | Example input | Placeholder |
 |---|---|---|
-| Timestamp (ISO, Apache CLF, syslog, bare date or time; bracketed forms keep their brackets: `[<TS>]`) | `2026-05-19T10:23:45.123Z`, `19/May/2026:10:23:45 +0000`, `10:23:45` | `<TS>` |
+| Timestamp (ISO, Apache CLF, syslog, bare date or time — including unpadded `2026-7-3` and secondless `14:22`; bracketed forms keep their brackets: `[<TS>]`) | `2026-05-19T10:23:45.123Z`, `19/May/2026:10:23:45 +0000`, `10:23:45`, `14:22` | `<TS>` |
 | URL | `https://api.example.com/v1?x=1` | `<URL>` |
 | Email | `alice@example.com` | `<EMAIL>` |
 | Stack frame | `(Service.java:142)` | `(<FILE>:<LINE>)` |
 | UUID | `550e8400-e29b-41d4-a716-446655440000` | `<UUID>` |
+| JWT / bearer token | `eyJhbGciOiJIUzI1NiJ9.eyJ1c2Vy…` | `<JWT>` |
 | MAC address | `aa:bb:cc:dd:ee:ff` | `<MAC>` |
-| Hex (`0x…` or bare 8+ chars with both digits and letters) | `0xdeadbeef`, `cafebabe1234` | `<HEX>` |
+| Hex (`0x…` or bare 7+ chars with both digits and letters — covers short git SHAs) | `0xdeadbeef`, `a3f8c21` | `<HEX>` |
 | IPv4 with port | `192.168.1.5:5432` | `<IP>:<PORT>` |
 | IPv4 | `192.168.1.5` | `<IP>` |
 | IPv6 | `fe80::1ff:fe23:4567:890a` | `<IP6>` |
-| Filesystem path (Unix or Windows) | `/var/log/app.log`, `C:\Program Files\foo` | `<PATH>` |
+| Filesystem path (Unix or Windows, incl. single-segment `/data`) | `/var/log/app.log`, `C:\Program Files\foo` | `<PATH>` |
+| Semantic version | `v2.14.3-rc1`, `1.8.22` | `<VER>` |
 | Size with unit | `45GB`, `2048MiB` | `<SIZE>` |
-| Duration with unit | `30s`, `1500ms` | `<DUR>` |
+| Duration with unit, incl. compound | `30s`, `1500ms`, `1h30m` | `<DUR>` |
 | Percent | `87%` | `<PCT>` |
 | Bare number | `9876` | `<N>` |
 | Quoted string | `"primary database"` | `<STR>` |
@@ -358,7 +360,7 @@ log-processor-go/
 │   ├── event.go          LogEvent
 │   ├── detector.go       AlertDetector — case-insensitive keyword match
 │   ├── restrict_mode.go  HIGH / MEDIUM / LOW enum
-│   ├── normalizer.go     LogMessageNormalizer — 22-rule regex pipeline
+│   ├── normalizer.go     LogMessageNormalizer — 26-rule regex pipeline
 │   └── pattern_store.go  AlertPatternStore — file-backed dedup set with size caps,
 │                         fsnotify watcher, and self-healing recovery
 ├── pipeline/
