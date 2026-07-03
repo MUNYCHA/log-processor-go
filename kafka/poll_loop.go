@@ -198,7 +198,7 @@ func NewSaramaConfig() *sarama.Config {
 	cfg.Consumer.Return.Errors = true
 	cfg.Consumer.Offsets.AutoCommit.Enable = false
 	cfg.Consumer.Offsets.Initial = sarama.OffsetNewest
-	cfg.Consumer.Fetch.Max = 1_048_576  // 1 MB per fetch response
+	cfg.Consumer.Fetch.Max = 1_048_576   // 1 MB per fetch response
 	cfg.Consumer.Fetch.Default = 262_144 // 256 KB per partition
 	cfg.ChannelBufferSize = 200
 	cfg.Consumer.Group.Session.Timeout = 10 * time.Second

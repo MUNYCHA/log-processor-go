@@ -27,6 +27,14 @@ Cross-compile for Linux from any machine:
 GOOS=linux GOARCH=amd64 go build -o log-processor-go .
 ```
 
+## Test
+
+```bash
+go test ./...
+```
+
+The suite needs no Kafka broker and no network. It covers the normalizer fingerprints (every token category and restrict mode), alert detection and dedup, the output-file failure scenarios (missing, deleted, truncated, recreated — never auto-created), pattern-file deletion/recreation self-healing, Telegram outage → auto-recovery and rate-limit handling (against a local fake server), the per-partition consume loop (via fakes), health endpoints, the status page, and config loading/validation. Run it before every deploy.
+
 ---
 
 ## Deploy
@@ -55,7 +63,7 @@ sudo systemctl enable --now log-processor-go
 The application **never creates any files** (no file is ever auto-created). Create the files you configure before starting.
 
 - **Output files are required.** Every topic's `output` file must exist, be a regular file, and be writable, or the app aborts at startup with a clear error.
-- **Pattern store files are optional at runtime.** If a configured `patternStoreFile` is missing or unwritable, the app still starts and keeps running — it just **disables deduplication** for that topic and sends every matching alert. The app never creates the pattern file.
+- **Pattern store files are optional at runtime.** If a configured `patternStoreFile` is missing or unwritable, the app still starts and keeps running — it just **disables deduplication** for that topic and sends every matching alert. Dedup **re-enables itself automatically** (checked every ~30 s) once the file becomes available. The app never creates the pattern file.
 
 ```bash
 touch /data/logs/received_app1.log
@@ -135,7 +143,7 @@ The application is driven by a single JSON file.
 | `topic` | Yes | Kafka topic name |
 | `output` | Yes | Absolute path to the output file — must exist before the app starts |
 | `alertKeywords` | No | Keywords that trigger an alert (case-insensitive substring match). Omit or leave empty to disable alerting for this topic |
-| `patternStoreFile` | No | Absolute path to the pattern store file for Telegram alert deduplication. Omit to send every matching alert without dedup. If set but missing or unwritable, dedup is disabled at runtime (every alert sent) — the app never creates this file |
+| `patternStoreFile` | No | Absolute path to the pattern store file for Telegram alert deduplication. Omit to send every matching alert without dedup. If set but missing or unwritable, dedup is disabled at runtime (every alert sent) and re-enables itself once the file is available again — the app never creates this file |
 | `customNormalizationRules` | No | Array of `{"pattern", "replacement"}` regex rules applied **before** the built-in normalizer. Use to collapse app-specific tokens, e.g. `[{"pattern":"worker-\\d+","replacement":"<WORKER>"}]` |
 | `patternExtractRestrictMode` | No | `high` (default), `medium`, or `low`. Controls how aggressively the normalizer collapses tokens before fingerprinting. Unknown values fall back to `high`. See [Pattern-extract restrict modes](#pattern-extract-restrict-modes) |
 
@@ -180,7 +188,7 @@ If a match is found, a `patternStoreFile` is configured, and dedup is active:
 3. **Already known** → suppressed (DEBUG log line, no Telegram)
 4. **New pattern** → appended to `patternStoreFile`, added to in-memory set, then Telegram queued
 
-If the pattern file cannot be written (missing or unwritable), deduplication is **disabled for the rest of the run** and **every** matching alert is sent — the run is logged once. The app never recreates the file. (Dedup is treated as best-effort: when in doubt it sends rather than silently suppresses.)
+If the pattern file cannot be written (missing or unwritable), deduplication is **disabled** and **every** matching alert is sent — logged once. A background check (every ~30 s) **re-enables dedup automatically** as soon as the file is readable and writable again, reloading the pattern set from it. The app never recreates the file itself. (Dedup is treated as best-effort: when in doubt it sends rather than silently suppresses.)
 
 ---
 
@@ -243,16 +251,16 @@ The pattern store file is watched at runtime via `fsnotify`. **Clearing or editi
 # Or selectively remove specific patterns by editing the file
 ```
 
-**Deleting** the file (rather than clearing it in place) is different: the app does not recreate it, so the next attempt to persist a pattern fails and **deduplication disables for the rest of the run** (every alert is then sent). Recreate the file and restart to re-enable dedup. If the parent directory is removed, the app warns and waits up to 2 minutes for it to return before the watcher gives up.
+**Deleting** the file (rather than clearing it in place) is different: the app does not recreate it, so the next attempt to persist a pattern fails and **deduplication disables** (every alert is then sent). **Recreate the file and dedup re-enables itself within ~30 seconds — no restart needed.** If the parent directory is removed, the app warns and waits for it to return — **no time limit** — then re-attaches the watcher and resumes automatically. The same applies to any watcher failure: it restarts itself with a backoff instead of giving up.
 
 ---
 
 ## Telegram Notifications
 
-- Reachability is **probed once at startup**; if Telegram is unreachable then, alert sending is disabled for the run
+- Reachability is **probed at startup**; if Telegram is unreachable then, alert sending is disabled and a background probe (every ~60 s) re-enables it once Telegram answers
 - Sends are serialised through a single goroutine — no parallel HTTP calls to the Telegram API
 - Rate-limited to a minimum of 3 seconds between sends; on HTTP `429` the interval doubles (up to 60 s cap) and resets to 3 s on the next success
-- On a **connectivity failure** (timeout / refused) that persists past retries, Telegram is treated as down and alert sending is **disabled for the rest of the run** — logged once with an occasional reminder; restart to re-enable
+- On a **connectivity failure** (timeout / refused) that persists past retries, Telegram is treated as down and alert sending is **disabled** — logged once with an occasional reminder. A background probe (every ~60 s) **re-enables sending automatically** when Telegram is reachable again; alerts arriving while disabled are dropped, not queued
 - **Persistent 429 rate-limiting** drops the individual alert but keeps alerting enabled (Telegram is reachable, just throttled)
 - A bounded queue (1000 events) decouples the consumer goroutines from the sender. If it fills — e.g. Telegram is slow — excess alerts are dropped (logged). This is non-blocking: **a slow or full Telegram never backpressures or stalls log writing**
 - Telegram failures never roll back or delay the output file write or the stored pattern
@@ -266,9 +274,24 @@ The pattern store file is watched at runtime via `fsnotify`. **Clearing or editi
 - Per-flush batches are **size-capped** (by message count and bytes) and buffers are **released after each flush**, so a burst cannot grow memory without bound
 - Invalid JSON records are logged with topic, partition, and offset, then skipped — a bad record does not stall the topic
 - Output file is opened and closed on every flush — copytruncate-style log rotation (`> file`, `truncate -s 0`) can safely clear the output file at any time. Rename-style rotation is **not** supported (the app never recreates a renamed-away file)
-- **Health endpoints on `:8080`:** `/livez` returns 200 whenever the process is running (liveness); `/healthz` returns 200 only when every topic's consumer is connected to Kafka (readiness)
+- **Health endpoints on `:8080`:** `/livez` returns 200 whenever the process is running (liveness); `/healthz` returns 200 only when every topic's consumer is connected to Kafka (readiness); `/statusz` is a human-readable status page (see below)
 - Logs are written to stdout/stderr (captured by systemd journal under the `log-processor` identifier)
 - Graceful shutdown on `SIGTERM` or `SIGINT`: consumers stop, pending Telegram alerts drain (up to 30 s), then the process exits
+
+### Status page
+
+`GET :8080/statusz` shows every component's live state — including the self-healing degradations that would otherwise only be visible in old log lines. One glance answers "is anything currently off, since when, and what do I do about it":
+
+```
+log-processor-go — DEGRADED (2 of 4 components) — uptime 3h12m4s
+
+OK        telegram                alert sending active
+DEGRADED  kafka[app1-topic]       disconnected — reconnecting with backoff  [since 2026-07-03 10:02:11, 14m3s]
+OK        output[app1-topic]      writing — last write 12s ago
+DEGRADED  dedup[app1-topic]       OFF — open failed: no such file — every alert sent; recreate the pattern file to re-enable  [since 2026-07-03 08:14:05, 2h2m]
+```
+
+Per topic it reports the Kafka consumer (connected / reconnecting), output writing (writing / paused with the error), and dedup (active with pattern count / off with the reason / not configured), plus the shared Telegram sender. The first line says `OK` or `DEGRADED (n of m components)`.
 
 ### Resource safety
 
@@ -284,14 +307,14 @@ Memory is bounded by design, regardless of how the binary is launched (the limit
 | Failure | Behavior |
 |---|---|
 | Output file missing at startup | Startup fails with a clear error message |
-| Pattern store file missing at startup | Starts anyway; dedup disabled for that topic, every alert sent |
+| Pattern store file missing at startup | Starts anyway; dedup disabled for that topic (every alert sent) until the file appears, then re-enables automatically |
 | Kafka unreachable at startup | Retries with backoff until reachable; `/healthz` reports not-ready; no RAM growth |
 | Kafka drops while running | Reconnects, then resumes from the newest offset (outage backlog dropped) |
 | Output file append fails while running | Batch retried every second, consumption pauses; logged once + ~30 s reminder + recovery log; no buffered message lost; file never recreated |
 | Output file deleted while running | Same retry/pause loop; holds until you recreate the file (not auto-created) |
 | Output file truncated/cleared while running | Next flush writes to the start of the cleared file — transparent |
-| Pattern file unwritable or deleted while running | Dedup disabled for the run, every alert sent; file not recreated |
-| Telegram unreachable (startup or while running) | Alert sending disabled for the run; logged once + occasional reminder |
+| Pattern file unwritable or deleted while running | Dedup disabled, every alert sent; re-enables automatically once the file is back (file never auto-created) |
+| Telegram unreachable (startup or while running) | Alert sending disabled; logged once + occasional reminder; re-enables automatically when Telegram answers again |
 | Telegram slow, queue full, or persistently rate-limited | Excess alerts dropped (logged); log writing unaffected |
 
 ---
@@ -306,7 +329,7 @@ The app only ever touches the files you configure. Full audit:
 | Append (existing file only) | Output log files, pattern store files |
 | Watch (inotify, read-only) | Parent directory of each pattern store file |
 | Outbound TCP | Kafka `bootstrapServers`, `api.telegram.org` |
-| Inbound TCP | Health server on `:8080` (`/livez`, `/healthz`) |
+| Inbound TCP | Health server on `:8080` (`/livez`, `/healthz`, `/statusz`) |
 
 The app **never creates any file** (no `O_CREATE` anywhere). No temp files, no writes to `/tmp`, no home directory changes, no subprocesses spawned. The only inbound port is the health server on `:8080`.
 
@@ -349,4 +372,4 @@ log-processor-go/
 
 - Do not commit real credentials in the config file — use `config.example.json` as a blank template
 - Kafka topics must exist before the application starts (or broker auto-creation must be enabled)
-- The application exposes a health server on `:8080` (`/livez`, `/healthz`) and no other inbound ports
+- The application exposes a health server on `:8080` (`/livez`, `/healthz`, `/statusz`) and no other inbound ports

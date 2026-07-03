@@ -43,6 +43,12 @@ var (
 		regexp2.MustCompile(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`, 0),
 		// 9. MAC address (before 0xHEX so colon-joined pairs are recognised first)
 		regexp2.MustCompile(`\b(?:[0-9a-fA-F]{2}[:\-]){5}[0-9a-fA-F]{2}\b`, 0),
+		// 9b. IPv6 — full 8-group form or compressed with "::". Must run here,
+		// before the hex/IPv4/number rules split the address into fragments
+		// (e.g. fe80::1ff:fe23:4567:890a → fe80::1ff:fe23:<N>:890a) that the
+		// later whole-token IPv6 check can no longer recognise. Requires all 8
+		// groups or a "::" so times (10:23:45) and MACs never match.
+		regexp2.MustCompile(`(?<![\w:.])(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,6}:(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,5})?|::[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})(?![\w:])`, 0),
 		// 10. 0x-prefixed hex
 		regexp2.MustCompile(`\b0x[0-9a-fA-F]+\b`, 0),
 		// 11. IPv4:port (before bare IPv4)
@@ -72,27 +78,28 @@ var (
 	// Literal replacement strings. Use replaceFunc so $ chars are never
 	// misinterpreted as regexp2 group references.
 	preReplacements = []string{
-		"<TS>",              // 1
-		"<TS>",              // 2
-		"<TS>",              // 3
-		"<URL>",             // 4
-		"<EMAIL>",           // 5
-		"(<FILE>:<LINE>)",   // 6
+		"<TS>",               // 1
+		"<TS>",               // 2
+		"<TS>",               // 3
+		"<URL>",              // 4
+		"<EMAIL>",            // 5
+		"(<FILE>:<LINE>)",    // 6
 		"$$Lambda$<N>/<HEX>", // 7  (literal output — contains $ signs)
-		"<UUID>",            // 8
-		"<MAC>",             // 9
-		"<HEX>",             // 10
-		"<IP>:<PORT>",       // 11
-		"<IP>",              // 12
-		"<PATH>",            // 13
-		"<PATH>",            // 14
-		"<TS>",              // 15
-		"<TS>",              // 16
-		"<HEX>",             // 17
-		"<SIZE>",            // 18
-		"<DUR>",             // 19
-		"<PCT>",             // 20
-		"<N>",               // 21
+		"<UUID>",             // 8
+		"<MAC>",              // 9
+		"<IP6>",              // 9b
+		"<HEX>",              // 10
+		"<IP>:<PORT>",        // 11
+		"<IP>",               // 12
+		"<PATH>",             // 13
+		"<PATH>",             // 14
+		"<TS>",               // 15
+		"<TS>",               // 16
+		"<HEX>",              // 17
+		"<SIZE>",             // 18
+		"<DUR>",              // 19
+		"<PCT>",              // 20
+		"<N>",                // 21
 	}
 
 	// MEDIUM-mode patterns (also run at LOW).
@@ -495,9 +502,9 @@ func isPeelable(c rune) bool {
 	return false
 }
 
-func isWhitespace(c rune) bool  { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
-func isDigit(c rune) bool       { return c >= '0' && c <= '9' }
-func isLetter(c rune) bool      { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
+func isWhitespace(c rune) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+func isDigit(c rune) bool      { return c >= '0' && c <= '9' }
+func isLetter(c rune) bool     { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
 func isHexChar(c rune) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }

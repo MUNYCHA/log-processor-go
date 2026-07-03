@@ -67,11 +67,29 @@ func main() {
 
 	saramaConfig := kafka.NewSaramaConfig()
 
-	tracker := health.NewReadinessTracker(len(cfg.Topics))
+	// Build all per-topic wiring first so the status page can reference every
+	// writer and pattern store before anything starts serving or consuming.
+	topicNames := make([]string, len(cfg.Topics))
+	loops := make([]*kafka.PollLoop, len(cfg.Topics))
+	statusRefs := make([]topicStatusRefs, len(cfg.Topics))
+	for i := range cfg.Topics {
+		t := &cfg.Topics[i]
+		handler, store := buildHandler(t)
+		writer := pipeline.NewBatchFileWriter(t.Output)
+		topicNames[i] = t.Topic
+		statusRefs[i] = topicStatusRefs{topic: t.Topic, writer: writer, store: store}
+		topicCtx := &kafka.TopicContext{Topic: t.Topic, Handler: handler, Writer: writer}
+		loops[i] = kafka.NewPollLoop(topicCtx, formatter, telegramCh)
+	}
 
+	tracker := health.NewReadinessTracker(topicNames)
+
+	statusHandler := health.NewStatusHandler(time.Now(), func() []health.Component {
+		return collectStatus(tracker, notifier, statusRefs)
+	})
 	healthSrv := &http.Server{
 		Addr:    healthAddr,
-		Handler: newHealthMux(tracker),
+		Handler: newHealthMux(tracker, statusHandler),
 	}
 	go func() {
 		slog.Info("health server listening", "addr", healthAddr)
@@ -84,19 +102,12 @@ func main() {
 	cancels := make([]context.CancelFunc, 0, len(cfg.Topics))
 
 	for i := range cfg.Topics {
-		t := &cfg.Topics[i]
-
-		handler := buildHandler(t)
-
-		writer := pipeline.NewBatchFileWriter(t.Output)
-		topicCtx := &kafka.TopicContext{Topic: t.Topic, Handler: handler, Writer: writer}
-		loop := kafka.NewPollLoop(topicCtx, formatter, telegramCh)
-
 		ctx, cancel := context.WithCancel(context.Background())
 		cancels = append(cancels, cancel)
 
 		brokers := cfg.BootstrapServers
-		topic := t.Topic
+		topic := cfg.Topics[i].Topic
+		loop := loops[i]
 		idx := i
 
 		consumerWg.Add(1)
@@ -118,7 +129,7 @@ func main() {
 				// occasionally that alerting is off.
 				if time.Since(lastReminder) >= telegramDisabledReminder {
 					lastReminder = time.Now()
-					slog.Warn("telegram disabled — dropping alerts for this run")
+					slog.Warn("telegram disabled — dropping alerts until it recovers")
 				}
 				continue
 			}
@@ -220,14 +231,81 @@ func logConsumerErrors(ctx context.Context, cg sarama.ConsumerGroup, topic strin
 	}
 }
 
-func newHealthMux(tracker *health.ReadinessTracker) http.Handler {
+func newHealthMux(tracker *health.ReadinessTracker, status http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", tracker)
 	mux.HandleFunc("/livez", health.Live)
+	mux.Handle("/statusz", status)
 	return mux
 }
 
-func buildHandler(t *config.TopicConfig) *pipeline.LogHandler {
+// topicStatusRefs ties one topic's writer and optional pattern store to its
+// name for the /statusz page.
+type topicStatusRefs struct {
+	topic  string
+	writer *pipeline.BatchFileWriter
+	store  *logpkg.AlertPatternStore // nil when no patternStoreFile configured
+}
+
+// collectStatus assembles the live component list for /statusz: the Telegram
+// sender, then per topic the Kafka consumer, output writing, and dedup state.
+func collectStatus(
+	tracker *health.ReadinessTracker,
+	notifier *notification.TelegramNotificationService,
+	topics []topicStatusRefs,
+) []health.Component {
+	comps := make([]health.Component, 0, 1+3*len(topics))
+
+	tgOK, tgSince, tgReason := notifier.Status()
+	tg := health.Component{Name: "telegram", OK: tgOK, Since: tgSince, Detail: "alert sending active"}
+	if !tgOK {
+		tg.Detail = "alert sending OFF — " + tgReason + " — re-enables automatically when reachable"
+	}
+	comps = append(comps, tg)
+
+	for _, ts := range tracker.Snapshot() {
+		c := health.Component{Name: "kafka[" + ts.Topic + "]", OK: ts.Ready, Since: ts.Since, Detail: "connected"}
+		if !ts.Ready {
+			c.Detail = "disconnected — reconnecting with backoff"
+		}
+		comps = append(comps, c)
+	}
+
+	for _, t := range topics {
+		ok, failingSince, lastWrite, errDetail := t.writer.Status()
+		c := health.Component{Name: "output[" + t.topic + "]", OK: ok}
+		switch {
+		case !ok:
+			c.Since = failingSince
+			c.Detail = "cannot write — " + errDetail + " — consumption paused, retrying every second"
+		case lastWrite.IsZero():
+			c.Detail = "ready (nothing written yet)"
+		default:
+			c.Detail = fmt.Sprintf("writing — last write %s ago", time.Since(lastWrite).Round(time.Second))
+		}
+		comps = append(comps, c)
+	}
+
+	for _, t := range topics {
+		c := health.Component{Name: "dedup[" + t.topic + "]", OK: true}
+		if t.store == nil {
+			c.Detail = "not configured — every alert sent"
+		} else if ok, since, reason, patterns := t.store.Status(); ok {
+			c.Since = since
+			c.Detail = fmt.Sprintf("active — %d patterns", patterns)
+		} else {
+			c.OK = false
+			c.Since = since
+			c.Detail = "OFF — " + reason + " — every alert sent; recreate the pattern file to re-enable"
+		}
+		comps = append(comps, c)
+	}
+	return comps
+}
+
+// buildHandler returns the topic's log handler plus its pattern store (nil
+// when no patternStoreFile is configured) so the status page can report on it.
+func buildHandler(t *config.TopicConfig) (*pipeline.LogHandler, *logpkg.AlertPatternStore) {
 	var rules []logpkg.NormalizerRule
 	if t.HasCustomNormalizationRules() {
 		for _, r := range t.CustomNormalizationRules {
@@ -248,21 +326,15 @@ func buildHandler(t *config.TopicConfig) *pipeline.LogHandler {
 	normalizer := logpkg.NewLogMessageNormalizer(rules, mode, keepWords)
 	detector := logpkg.NewAlertDetector(t.AlertKeywords)
 
+	// Pattern dedup is best-effort: if the file is missing or unreadable the
+	// store starts disabled (every detected alert is sent) and re-enables
+	// itself once the file is back. The file is never created by the app.
 	var store *logpkg.AlertPatternStore
 	if t.HasPatternStore() {
-		s, err := logpkg.NewAlertPatternStore(t.PatternStoreFile)
-		if err != nil {
-			// Pattern dedup is best-effort: if the store can't be loaded, run
-			// without it (every detected alert is sent) rather than refusing to
-			// start. The file is never created by the app.
-			slog.Error("pattern store unavailable — dedup disabled for this topic, all alerts will be sent",
-				"topic", t.Topic, "file", t.PatternStoreFile, "error", err)
-		} else {
-			store = s
-		}
+		store = logpkg.NewAlertPatternStore(t.PatternStoreFile)
 	}
 
-	return pipeline.NewLogHandler(detector, normalizer, store)
+	return pipeline.NewLogHandler(detector, normalizer, store), store
 }
 
 func validatePaths(t *config.TopicConfig) error {

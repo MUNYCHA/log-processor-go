@@ -15,10 +15,18 @@ import (
 )
 
 const (
-	warnThreshold      = 10_000
-	maxWatcherRestarts = 5
-	dirPollInterval    = 5 * time.Second
-	dirPollMaxAttempts = 24 // 24 × 5s = 2 minutes
+	warnThreshold           = 10_000
+	watcherRestartBaseDelay = 2 * time.Second
+	watcherRestartMaxDelay  = 60 * time.Second
+	dirWaitLogInterval      = time.Minute
+)
+
+// recoverProbeInterval is how often a disabled store re-checks whether the
+// pattern file is back. dirPollInterval is how often a vanished parent
+// directory is re-checked. Vars (not consts) so tests can shorten them.
+var (
+	recoverProbeInterval = 30 * time.Second
+	dirPollInterval      = 5 * time.Second
 )
 
 type AlertPatternStore struct {
@@ -26,31 +34,87 @@ type AlertPatternStore struct {
 	mu          sync.RWMutex
 	known       map[string]struct{}
 	disabled    atomic.Bool
+
+	// stateMu guards the status-page fields below. It is separate from mu
+	// because disable() runs while Add() already holds mu.
+	stateMu       sync.Mutex
+	stateSince    time.Time // when the enabled/disabled state last changed
+	disableReason string    // why dedup is off; "" when enabled
 }
 
-// Disabled reports whether dedup has been turned off for this run (because the
-// pattern file became unwritable). When disabled, callers should send every
-// alert rather than suppress.
+// Disabled reports whether dedup is currently off (because the pattern file is
+// missing or unwritable). When disabled, callers should send every alert
+// rather than suppress. Dedup re-enables itself once the file is back — see
+// recoverLoop.
 func (s *AlertPatternStore) Disabled() bool { return s.disabled.Load() }
 
-// disable turns dedup off for the rest of the run, logging once on transition.
+// disable turns dedup off, logging once on the transition, and starts a
+// background loop that re-enables it as soon as the pattern file is readable
+// and writable again. The file is never created by the app.
 func (s *AlertPatternStore) disable(reason string, err error) {
 	if s.disabled.CompareAndSwap(false, true) {
-		slog.Error("pattern file not writable — dedup disabled for this run, all alerts will be sent",
+		s.setState(reason + ": " + err.Error())
+		slog.Error("pattern file unavailable — dedup disabled, all alerts will be sent until the file is back",
 			"file", s.patternFile, "reason", reason, "error", err)
+		go s.recoverLoop()
 	}
 }
 
-func NewAlertPatternStore(patternFile string) (*AlertPatternStore, error) {
+func (s *AlertPatternStore) setState(reason string) {
+	s.stateMu.Lock()
+	s.stateSince = time.Now()
+	s.disableReason = reason
+	s.stateMu.Unlock()
+}
+
+// Status reports the store's current state for the status page.
+func (s *AlertPatternStore) Status() (ok bool, since time.Time, reason string, patterns int) {
+	ok = !s.disabled.Load()
+	s.stateMu.Lock()
+	since, reason = s.stateSince, s.disableReason
+	s.stateMu.Unlock()
+	s.mu.RLock()
+	patterns = len(s.known)
+	s.mu.RUnlock()
+	return ok, since, reason, patterns
+}
+
+// recoverLoop probes the pattern file until it is writable and loadable again,
+// then re-enables dedup with a freshly loaded pattern set. Runs once per
+// disable transition (guarded by the CompareAndSwap in disable) and exits on
+// success. Probe failures are silent to keep a long outage from spamming logs.
+func (s *AlertPatternStore) recoverLoop() {
+	for {
+		time.Sleep(recoverProbeInterval)
+		f, err := os.OpenFile(s.patternFile, os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			continue
+		}
+		f.Close()
+		if err := s.load(); err != nil {
+			continue
+		}
+		s.setState("")
+		s.disabled.Store(false)
+		slog.Info("pattern file available again — dedup re-enabled", "file", s.patternFile)
+		return
+	}
+}
+
+// NewAlertPatternStore always returns a usable store. If the pattern file is
+// missing or unreadable at construction, dedup starts disabled and recovers
+// automatically once the file appears.
+func NewAlertPatternStore(patternFile string) *AlertPatternStore {
 	s := &AlertPatternStore{
 		patternFile: patternFile,
 		known:       make(map[string]struct{}),
+		stateSince:  time.Now(),
 	}
 	if err := s.load(); err != nil {
-		return nil, err
+		s.disable("initial load failed", err)
 	}
 	go s.startWatcher()
-	return s, nil
+	return s
 }
 
 func (s *AlertPatternStore) load() error {
@@ -145,32 +209,27 @@ func (s *AlertPatternStore) Add(pattern string) bool {
 	return true
 }
 
+// startWatcher keeps the watch loop alive for the life of the process — it
+// never gives up. A vanished parent directory is waited out indefinitely
+// (dedup re-enabling is handled independently by recoverLoop), and any other
+// watcher failure restarts with capped exponential backoff so a persistent
+// problem logs at most about once a minute.
 func (s *AlertPatternStore) startWatcher() {
-	crashCount := 0
-	for crashCount <= maxWatcherRestarts {
+	delay := watcherRestartBaseDelay
+	for {
 		err := s.runWatchLoop()
 		if err == nil {
 			return // clean stop
 		}
 		dir := filepath.Dir(s.patternFile)
 		if _, statErr := os.Stat(dir); os.IsNotExist(statErr) {
-			slog.Warn("watched directory gone, waiting for it to return", "dir", dir)
-			if s.waitForDirectory(dir) {
-				slog.Info("directory returned, restarting watcher", "dir", dir)
-				continue // don't count this as a crash
-			}
-			slog.Error("FATAL: watched directory did not return after 2 minutes — pattern resets require app restart")
-			return
+			s.waitForDirectory(dir)
+			delay = watcherRestartBaseDelay // outage over, not a crash: reset backoff
+			continue
 		}
-		crashCount++
-		if crashCount > maxWatcherRestarts {
-			slog.Error("FATAL: watcher stopped after max restarts — pattern resets require app restart",
-				"restarts", maxWatcherRestarts, "error", err)
-			return
-		}
-		slog.Warn("watcher crashed, restarting",
-			"attempt", crashCount, "max", maxWatcherRestarts, "error", err)
-		time.Sleep(2 * time.Second)
+		slog.Warn("pattern file watcher failed, restarting", "in", delay, "error", err)
+		time.Sleep(delay)
+		delay = min(delay*2, watcherRestartMaxDelay)
 	}
 }
 
@@ -193,6 +252,13 @@ func (s *AlertPatternStore) runWatchLoop() error {
 			if !ok {
 				return nil
 			}
+			// When the watched directory itself is removed or renamed, inotify
+			// silently drops the watch — without this check the loop would keep
+			// running but never see another event. Surface it as an error so
+			// startWatcher waits for the directory and re-establishes the watch.
+			if event.Name == dir && (event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename)) {
+				return errors.New("watched directory removed or renamed")
+			}
 			if filepath.Base(event.Name) != filename {
 				continue
 			}
@@ -213,16 +279,26 @@ func (s *AlertPatternStore) runWatchLoop() error {
 	}
 }
 
-func (s *AlertPatternStore) waitForDirectory(dir string) bool {
-	for i := 0; i < dirPollMaxAttempts; i++ {
+// waitForDirectory blocks until dir exists again — no time limit. It logs once
+// when the wait starts, then only an occasional reminder, so a long outage
+// cannot flood the log.
+func (s *AlertPatternStore) waitForDirectory(dir string) {
+	slog.Warn("watched directory gone — waiting for it to return", "dir", dir)
+	start := time.Now()
+	lastLog := start
+	for {
 		time.Sleep(dirPollInterval)
 		if _, err := os.Stat(dir); err == nil {
-			return true
+			slog.Info("directory returned, restarting pattern file watcher",
+				"dir", dir, "gone_for", time.Since(start).Round(time.Second))
+			return
 		}
-		slog.Warn("still waiting for directory to return",
-			"attempt", i+1, "max", dirPollMaxAttempts, "dir", dir)
+		if time.Since(lastLog) >= dirWaitLogInterval {
+			lastLog = time.Now()
+			slog.Warn("still waiting for watched directory",
+				"dir", dir, "gone_for", time.Since(start).Round(time.Second))
+		}
 	}
-	return false
 }
 
 func mapsEqual(a, b map[string]struct{}) bool {
