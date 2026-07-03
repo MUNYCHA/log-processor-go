@@ -95,6 +95,29 @@ func TestConsumeClaimWritesBatchAndEnqueuesAlerts(t *testing.T) {
 	}
 }
 
+// TestConsumeClaimRecoversFromPanic: a bug that panics while processing one
+// partition must surface as an error (so the session reconnects) instead of
+// crashing the whole process.
+func TestConsumeClaimRecoversFromPanic(t *testing.T) {
+	handler := pipeline.NewLogHandler(
+		logpkg.NewAlertDetector(nil),
+		logpkg.NewLogMessageNormalizer(nil, logpkg.High, nil),
+		nil,
+	)
+	// nil Writer makes the flush phase panic — stands in for any future bug.
+	ctx := &TopicContext{Topic: "app1-topic", Handler: handler, Writer: nil}
+	loop := NewPollLoop(ctx, notification.NewTelegramAlertFormatter(), make(chan *logpkg.LogEvent, 1))
+
+	ch := make(chan *sarama.ConsumerMessage, 1)
+	ch <- msg(`{"serverName":"srv1","topic":"app1-topic","message":"line"}`)
+	close(ch)
+
+	err := loop.ConsumeClaim(fakeSession{ctx: context.Background()}, fakeClaim{ch: ch})
+	if err == nil {
+		t.Fatal("a panic must be converted into an error, not swallowed or crash")
+	}
+}
+
 // TestFlushWithRetryWaitsForFileRecreation is the "output file deleted
 // mid-run" scenario: the flush pauses, holds the data, and completes as soon
 // as the operator recreates the file.

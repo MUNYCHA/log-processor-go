@@ -2,9 +2,11 @@ package main
 
 import (
 	"errors"
+	"math"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,29 @@ import (
 	"log-processor-go/notification"
 	"log-processor-go/pipeline"
 )
+
+// TestDefaultMemoryLimit: the binary applies its own soft memory limit when
+// run bare (no GOMEMLIMIT in the environment) and defers to the operator's
+// value when one is set.
+func TestDefaultMemoryLimit(t *testing.T) {
+	orig := debug.SetMemoryLimit(-1) // read current without changing
+	debug.SetMemoryLimit(orig)
+	t.Cleanup(func() { debug.SetMemoryLimit(orig) })
+
+	t.Setenv("GOMEMLIMIT", "")
+	debug.SetMemoryLimit(math.MaxInt64)
+	applyDefaultMemoryLimit()
+	if got := debug.SetMemoryLimit(-1); got != defaultMemoryLimit {
+		t.Errorf("bare run limit = %d, want built-in %d", got, int64(defaultMemoryLimit))
+	}
+
+	t.Setenv("GOMEMLIMIT", "256MiB")
+	debug.SetMemoryLimit(math.MaxInt64)
+	applyDefaultMemoryLimit()
+	if got := debug.SetMemoryLimit(-1); got != math.MaxInt64 {
+		t.Error("an operator-set GOMEMLIMIT must not be overridden")
+	}
+}
 
 // TestStatuszReportsHealthyAndDegradedComponents renders /statusz with one
 // component per state: Kafka disconnected, output writing fine, Telegram

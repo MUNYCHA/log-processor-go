@@ -19,7 +19,24 @@ const (
 	watcherRestartBaseDelay = 2 * time.Second
 	watcherRestartMaxDelay  = 60 * time.Second
 	dirWaitLogInterval      = time.Minute
+
+	// maxPatternLen caps a single stored pattern. A pattern from a huge log
+	// line (Kafka messages can be ~1MB) would bloat the file and memory for
+	// no dedup value; oversized patterns are not stored and their alerts are
+	// always sent. Also protects load(): a stored line beyond the scanner
+	// limit would otherwise make every future load fail and kill dedup.
+	maxPatternLen = 8 * 1024
+	// scanBufLen is the line limit when reading the pattern file — comfortably
+	// above maxPatternLen so hand-edited or legacy files still load.
+	scanBufLen = 1 << 20
 )
+
+// maxPatterns caps the in-memory dedup set so RAM stays bounded for the life
+// of the process even if normalization misses a variable token and patterns
+// keep accumulating. At the cap, known patterns still dedup but new ones are
+// not stored — their alerts are always sent (fail open). A var so tests can
+// lower it.
+var maxPatterns = 50_000
 
 // recoverProbeInterval is how often a disabled store re-checks whether the
 // pattern file is back. dirPollInterval is how often a vanished parent
@@ -40,6 +57,9 @@ type AlertPatternStore struct {
 	stateMu       sync.Mutex
 	stateSince    time.Time // when the enabled/disabled state last changed
 	disableReason string    // why dedup is off; "" when enabled
+
+	growthWarned atomic.Bool // warnThreshold crossed; log it only once
+	capWarned    atomic.Bool // maxPatterns reached; log it only once
 }
 
 // Disabled reports whether dedup is currently off (because the pattern file is
@@ -117,44 +137,50 @@ func NewAlertPatternStore(patternFile string) *AlertPatternStore {
 	return s
 }
 
-func (s *AlertPatternStore) load() error {
+// readPatterns reads the pattern file into a fresh set, skipping blank,
+// oversized, and beyond-cap lines so one bad line can never poison loading.
+func (s *AlertPatternStore) readPatterns() (map[string]struct{}, error) {
 	f, err := os.Open(s.patternFile)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close()
 
 	next := make(map[string]struct{})
 	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), scanBufLen)
 	for sc.Scan() {
-		if line := strings.TrimSpace(sc.Text()); line != "" {
-			next[line] = struct{}{}
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || len(line) > maxPatternLen {
+			continue
 		}
+		if len(next) >= maxPatterns {
+			break
+		}
+		next[line] = struct{}{}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+func (s *AlertPatternStore) load() error {
+	next, err := s.readPatterns()
+	if err != nil {
+		return err
 	}
 	s.mu.Lock()
 	s.known = next
 	s.mu.Unlock()
 	slog.Info("loaded patterns", "count", len(next), "file", s.patternFile)
-	return sc.Err()
+	return nil
 }
 
 func (s *AlertPatternStore) reload() {
-	f, err := os.Open(s.patternFile)
+	next, err := s.readPatterns()
 	if err != nil {
 		slog.Warn("reload failed, keeping previous patterns", "error", err)
-		return
-	}
-	defer f.Close()
-
-	next := make(map[string]struct{})
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		if line := strings.TrimSpace(sc.Text()); line != "" {
-			next[line] = struct{}{}
-		}
-	}
-	if sc.Err() != nil {
-		slog.Warn("reload scan error, keeping previous patterns", "error", sc.Err())
 		return
 	}
 
@@ -180,11 +206,30 @@ func (s *AlertPatternStore) IsKnown(pattern string) bool {
 }
 
 // Add persists the pattern to disk before exposing it in-memory.
-// Returns false if disk persistence fails; the caller must not send
-// a Telegram alert in that case.
+// Returns false when the pattern was not stored — persistence failed, the
+// pattern is oversized, or the store is at capacity. The caller must then
+// send the alert rather than suppress it (dedup fails open).
 func (s *AlertPatternStore) Add(pattern string) bool {
+	// Oversized patterns are never stored: no dedup value, and a stored line
+	// this long would break future loads of the file.
+	if len(pattern) > maxPatternLen {
+		slog.Debug("pattern too long to store, alert always sent", "len", len(pattern))
+		return false
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Hard cap: keep RAM bounded for the life of the process. Existing
+	// patterns still suppress; new ones alert every time.
+	if len(s.known) >= maxPatterns {
+		if s.capWarned.CompareAndSwap(false, true) {
+			slog.Error("pattern cap reached — new patterns no longer stored, their alerts always sent; "+
+				"normalization is likely missing a variable token type",
+				"cap", maxPatterns, "file", s.patternFile)
+		}
+		return false
+	}
 
 	// No O_CREATE: the app never creates the pattern file. If it is missing or
 	// unwritable, dedup disables itself (below) and all alerts are sent.
@@ -202,7 +247,7 @@ func (s *AlertPatternStore) Add(pattern string) bool {
 
 	s.known[pattern] = struct{}{}
 
-	if len(s.known) >= warnThreshold {
+	if len(s.known) >= warnThreshold && s.growthWarned.CompareAndSwap(false, true) {
 		slog.Warn("patterns accumulated — normalization may be missing a variable token type",
 			"count", len(s.known), "file", s.patternFile)
 	}

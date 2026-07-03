@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
@@ -26,6 +27,12 @@ const (
 	telegramDrainWait        = 30 * time.Second
 	telegramDisabledReminder = 5 * time.Minute
 	healthAddr               = ":8080"
+
+	// defaultMemoryLimit is the built-in Go soft memory limit, applied when no
+	// GOMEMLIMIT is set in the environment. It keeps GC pressure bounded even
+	// when the bare binary is run outside the systemd unit (which sets
+	// GOMEMLIMIT=112MiB itself, below its MemoryMax=128M cgroup cap).
+	defaultMemoryLimit = 112 << 20 // 112 MiB
 )
 
 // consumerGroupID is unique per process start so the consumer always begins at
@@ -34,7 +41,19 @@ const (
 // Kafka outage instead of replaying it — keeping memory flat through recovery.
 var consumerGroupID = fmt.Sprintf("file-log-consumer-%d", time.Now().UnixNano())
 
+// applyDefaultMemoryLimit installs the built-in soft memory limit unless the
+// operator already set one via GOMEMLIMIT (the runtime honours that itself).
+func applyDefaultMemoryLimit() {
+	if os.Getenv("GOMEMLIMIT") != "" {
+		return
+	}
+	debug.SetMemoryLimit(defaultMemoryLimit)
+	slog.Info("applied built-in soft memory limit", "limit", "112MiB")
+}
+
 func main() {
+	applyDefaultMemoryLimit()
+
 	cfg, path, err := config.Load(os.Args[1:])
 	if err != nil {
 		slog.Error("failed to load config", "error", err)

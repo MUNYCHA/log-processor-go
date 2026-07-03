@@ -9,7 +9,7 @@
 | Requirement | Version |
 |---|---|
 | Go | 1.21+ |
-| Apache Kafka | Reachable broker |
+| Apache Kafka | 2.0+ (reachable broker) |
 
 No database. No JVM.
 
@@ -43,8 +43,10 @@ Copy the binary and config to the server:
 
 ```bash
 scp log-processor-go user@server:/opt/log-processor-go/
-scp config.example.json user@server:/etc/log-processor-go/consumer_config.json
+scp config.example.json user@server:/etc/log-processor-go/config.json
 ```
+
+> The filename matters: the systemd unit starts the app with `--config=/etc/log-processor-go/config.json`.
 
 Install and start the systemd service:
 
@@ -200,7 +202,7 @@ Variable tokens in log messages are replaced with structural placeholders before
 
 | Category | Example input | Placeholder |
 |---|---|---|
-| Timestamp (ISO, Apache CLF, syslog, bare date or time, bracketed `[..]`) | `2026-05-19T10:23:45.123Z`, `19/May/2026:10:23:45 +0000`, `10:23:45` | `<TS>` |
+| Timestamp (ISO, Apache CLF, syslog, bare date or time; bracketed forms keep their brackets: `[<TS>]`) | `2026-05-19T10:23:45.123Z`, `19/May/2026:10:23:45 +0000`, `10:23:45` | `<TS>` |
 | URL | `https://api.example.com/v1?x=1` | `<URL>` |
 | Email | `alice@example.com` | `<EMAIL>` |
 | Stack frame | `(Service.java:142)` | `(<FILE>:<LINE>)` |
@@ -239,6 +241,10 @@ Pattern: could not connect to <IP>:<PORT> after <DUR> retries=<N>
 | All other token types (`<TS>`, `<IP>`, `<UUID>`, `key=val`, …) | replaced | replaced | replaced |
 
 Use `high` (the default) unless a topic produces repeated near-duplicate alerts that differ only in embedded numbers or hex strings. `low` risks merging genuinely different alerts under one fingerprint, permanently suppressing their Telegram notifications — verify the result per topic before rolling it out.
+
+### Pattern store limits
+
+The in-memory pattern set is hard-capped at **50,000 patterns**, and a single pattern longer than **8 KB** is never stored. Beyond either limit, dedup keeps working for the patterns already known, and new shapes simply always alert (fail open — nothing is ever silently suppressed by the limits). A warning is logged once when the set passes 10,000 patterns: that usually means normalization is missing a variable token type and the fix is a `customNormalizationRules` entry or a lower restrict mode, then clearing the pattern file.
 
 ### Resetting suppressed patterns
 
@@ -300,7 +306,8 @@ Memory is bounded by design, regardless of how the binary is launched (the limit
 - **Kafka outage** → idle, no messages flow, RAM flat. On recovery the backlog is skipped, so there is no catch-up surge.
 - **Slow Kafka** → consumes at the broker's pace; the backlog waits on the broker, not in the app. RAM flat.
 - **Slow / full Telegram** → the 1000-event alert queue drops on overflow (never blocks); log writing is unaffected.
-- **Per-process memory** → bounded by sarama's fetch buffers plus the size-capped batch per partition. The systemd unit additionally sets `GOMEMLIMIT=112MiB` (GC pressure below the `MemoryMax=128M` cgroup cap). Running the bare binary keeps every code-level bound; it only loses the cgroup cap and auto-restart.
+- **Per-process memory** → bounded by sarama's fetch buffers plus the size-capped batch per partition, and the in-memory dedup set is hard-capped (see below). The binary applies a **built-in `GOMEMLIMIT` of 112 MiB** when none is set in the environment, so the GC discipline holds even on a bare run; the systemd unit sets the same value explicitly plus a `MemoryMax=128M` cgroup hard cap. Running the bare binary keeps every code-level bound — it only loses the kernel-enforced cap and auto-restart.
+- **Bug containment** → a panic while processing one partition is recovered and logged; that consumer reconnects and every other topic keeps running. The process does not die.
 
 ### Failure policy
 
@@ -316,6 +323,8 @@ Memory is bounded by design, regardless of how the binary is launched (the limit
 | Pattern file unwritable or deleted while running | Dedup disabled, every alert sent; re-enables automatically once the file is back (file never auto-created) |
 | Telegram unreachable (startup or while running) | Alert sending disabled; logged once + occasional reminder; re-enables automatically when Telegram answers again |
 | Telegram slow, queue full, or persistently rate-limited | Excess alerts dropped (logged); log writing unaffected |
+| Bug/panic while processing a partition | Recovered and logged; that consumer reconnects; the process and all other topics keep running |
+| Pattern set hits the 50,000 cap | Known patterns keep deduping; new shapes always alert; logged once |
 
 ---
 
@@ -339,7 +348,8 @@ The app **never creates any file** (no `O_CREATE` anywhere). No temp files, no w
 
 ```
 log-processor-go/
-├── main.go               entry point — wiring, path validation, signal handling, shutdown
+├── main.go               entry point — wiring, path validation, built-in memory
+│                         limit, /statusz assembly, signal handling, shutdown
 ├── go.mod
 ├── config/
 │   ├── config.go         AppConfig, TopicConfig, NormalizationRule structs
@@ -348,23 +358,29 @@ log-processor-go/
 │   ├── event.go          LogEvent
 │   ├── detector.go       AlertDetector — case-insensitive keyword match
 │   ├── restrict_mode.go  HIGH / MEDIUM / LOW enum
-│   ├── normalizer.go     LogMessageNormalizer — 21-rule regex pipeline
-│   └── pattern_store.go  AlertPatternStore — file-backed dedup set + fsnotify watcher
+│   ├── normalizer.go     LogMessageNormalizer — 22-rule regex pipeline
+│   └── pattern_store.go  AlertPatternStore — file-backed dedup set with size caps,
+│                         fsnotify watcher, and self-healing recovery
 ├── pipeline/
 │   ├── handler.go        LogHandler — two-phase record processing (stateless, goroutine-safe)
 │   └── batch_writer.go   BatchFileWriter — mutex-serialised append-only file writer
 ├── health/
-│   └── health.go         ReadinessTracker + /livez liveness handler (:8080)
+│   └── health.go         ReadinessTracker (/healthz), /livez, /statusz status page
 ├── kafka/
 │   ├── poll_loop.go      PollLoop (sarama ConsumerGroupHandler) + sarama config
 │   └── retry.go          consumer-group creation with exponential-backoff retry
 ├── notification/
 │   ├── notifier.go       Notifier interface
 │   ├── formatter.go      TelegramAlertFormatter — LogEvent → alert text
-│   └── telegram.go       TelegramNotificationService — probe, rate-limit, auto-disable
+│   └── telegram.go       TelegramNotificationService — probe, rate-limit,
+│                         auto-disable + background auto-recovery
+├── tools/
+│   └── producer/         developer-only Kafka message generator (not deployed)
 └── deploy/
     └── log-processor-go.service   systemd unit file
 ```
+
+Every package also has `*_test.go` files — the automated suite described under [Test](#test).
 
 ---
 

@@ -3,6 +3,7 @@ package logpkg
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -110,6 +111,76 @@ func TestWatcherSurvivesDirectoryRemovalAndRecreation(t *testing.T) {
 		}
 		return s.IsKnown("external pattern")
 	})
+}
+
+// TestAddRejectsOversizedPattern: huge patterns are never stored (they would
+// poison future loads of the file) but must not disable dedup either — the
+// alert is simply always sent.
+func TestAddRejectsOversizedPattern(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "patterns.txt")
+	if err := os.WriteFile(file, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := NewAlertPatternStore(file)
+
+	huge := strings.Repeat("a", maxPatternLen+1)
+	if s.Add(huge) {
+		t.Error("oversized pattern must not be stored")
+	}
+	if s.Disabled() {
+		t.Error("oversized pattern must not disable dedup")
+	}
+	if b, _ := os.ReadFile(file); len(b) != 0 {
+		t.Error("oversized pattern must not be written to the file")
+	}
+	if !s.Add("normal pattern") {
+		t.Error("normal patterns must still store fine afterwards")
+	}
+}
+
+// TestPatternCapBoundsMemory: at the cap, existing patterns keep deduping,
+// new ones are not stored (their alerts always send), and dedup stays enabled.
+func TestPatternCapBoundsMemory(t *testing.T) {
+	origCap := maxPatterns
+	maxPatterns = 2
+	t.Cleanup(func() { maxPatterns = origCap })
+
+	file := filepath.Join(t.TempDir(), "patterns.txt")
+	if err := os.WriteFile(file, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := NewAlertPatternStore(file)
+
+	if !s.Add("pattern one") || !s.Add("pattern two") {
+		t.Fatal("adds below the cap must succeed")
+	}
+	if s.Add("pattern three") {
+		t.Error("add at the cap must be refused")
+	}
+	if s.Disabled() {
+		t.Error("hitting the cap must not disable dedup")
+	}
+	if !s.IsKnown("pattern one") || !s.IsKnown("pattern two") {
+		t.Error("existing patterns must keep deduping at the cap")
+	}
+}
+
+// TestLoadTolerantOfBadLines: one oversized line in the file must not break
+// loading — the good patterns still load and dedup stays enabled.
+func TestLoadTolerantOfBadLines(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "patterns.txt")
+	content := "good pattern\n" + strings.Repeat("x", maxPatternLen*2) + "\nanother good one\n"
+	if err := os.WriteFile(file, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := NewAlertPatternStore(file)
+
+	if s.Disabled() {
+		t.Fatal("store must load despite an oversized line")
+	}
+	if !s.IsKnown("good pattern") || !s.IsKnown("another good one") {
+		t.Error("good patterns around the bad line must load")
+	}
 }
 
 func TestStoreStartsDisabledWhenFileMissingThenRecovers(t *testing.T) {

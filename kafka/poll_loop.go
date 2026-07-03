@@ -1,6 +1,7 @@
 package kafka
 
 import (
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -59,7 +60,18 @@ type batchItem struct {
 	event *logpkg.LogEvent
 }
 
-func (p *PollLoop) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+func (p *PollLoop) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) (err error) {
+	// A panic while processing one partition must not take down the whole
+	// process: recover, surface it as an error so the consumer loop tears the
+	// session down and reconnects, and keep serving every other topic.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic in consume loop recovered — session will reconnect",
+				"topic", claim.Topic(), "partition", claim.Partition(), "panic", r)
+			err = fmt.Errorf("panic in consume loop: %v", r)
+		}
+	}()
+
 	var buf strings.Builder
 	var batch []batchItem
 
