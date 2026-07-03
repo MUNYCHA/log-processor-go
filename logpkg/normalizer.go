@@ -27,12 +27,13 @@ var (
 	prePatterns = []*regexp2.Regexp{
 		// 1. Combined date+time (ISO and slash-separated)
 		regexp2.MustCompile(`\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?`, 0),
-		// 2. Apache CLF timestamp
-		regexp2.MustCompile(`\d{1,2}/(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/\d{4}:\d{1,2}:\d{2}:\d{2}(?: +[+-]\d{4})?`, 0),
+		// 2. Apache CLF timestamp (HAProxy appends fractional seconds)
+		regexp2.MustCompile(`\d{1,2}/(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/\d{4}:\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?(?: +[+-]\d{4})?`, 0),
 		// 3. Syslog timestamp
 		regexp2.MustCompile(`(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +\d{1,2} +\d{2}:\d{2}:\d{2}`, 0),
-		// 4. URL
-		regexp2.MustCompile(`(?:https?|wss?|ftp)://\S+`, 0),
+		// 4. URL — stops at quotes so a quoted URL ("http://…") never eats its
+		// closing quote and breaks quote pairing for the rest of the line
+		regexp2.MustCompile(`(?:https?|wss?|ftp)://[^\s"'<>]+`, 0),
 		// 5. Email
 		regexp2.MustCompile(`\b[\w.+-]+@[\w.\-]+\.[A-Za-z]{2,}\b`, 0),
 		// 6. Java stack frame parens: (Foo.java:42)
@@ -79,8 +80,8 @@ var (
 		// 17. Bare hex 7+ chars (short git SHA and up) — requires at least
 		// one digit AND one letter so plain words and plain numbers survive
 		regexp2.MustCompile(`\b(?=[0-9a-fA-F]*\d)(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{7,}\b`, 0),
-		// 18. Size with unit
-		regexp2.MustCompile(`\b\d+(?:\.\d+)?(?:KB|MB|GB|TB|KiB|MiB|GiB|TiB|B)\b`, 0),
+		// 18. Size with unit, any case (kernel logs write kB)
+		regexp2.MustCompile(`\b\d+(?:\.\d+)?(?i:[kmgt]i?b|b)\b`, 0),
 		// 19. Duration with unit, including compound forms like 1h30m
 		regexp2.MustCompile(`\b(?:\d+(?:\.\d+)?(?:ns|us|ms|s|m|h|d))+\b`, 0),
 		// 20. Percent
