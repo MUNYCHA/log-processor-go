@@ -33,7 +33,7 @@ GOOS=linux GOARCH=amd64 go build -o log-processor-go .
 go test ./...
 ```
 
-The suite needs no Kafka broker and no network. It covers the normalizer fingerprints (every token category and restrict mode), alert detection and dedup, the output-file failure scenarios (missing, deleted, truncated, recreated — never auto-created), pattern-file deletion/recreation self-healing, Telegram outage → auto-recovery and rate-limit handling (against a local fake server), the per-partition consume loop (via fakes), health endpoints, the status page, and config loading/validation. Run it before every deploy.
+The suite needs no Kafka broker and no network. It covers the normalizer fingerprints (every token category and restrict mode), alert detection and dedup, the alert-path bounds (regex-timeout fail-open, 8 KB truncation, pattern count/byte caps), the output-file failure scenarios (missing, deleted, truncated, recreated — never auto-created), pattern-file deletion/recreation self-healing, Telegram outage → auto-recovery and rate-limit handling (against a local fake server), the per-partition consume loop (via fakes), health endpoints, the status page, and config loading/validation. Run it before every deploy.
 
 ---
 
@@ -246,7 +246,14 @@ Use `high` (the default) unless a topic produces repeated near-duplicate alerts 
 
 ### Pattern store limits
 
-The in-memory pattern set is hard-capped at **50,000 patterns**, and a single pattern longer than **8 KB** is never stored. Beyond either limit, dedup keeps working for the patterns already known, and new shapes simply always alert (fail open — nothing is ever silently suppressed by the limits). A warning is logged once when the set passes 10,000 patterns: that usually means normalization is missing a variable token type and the fix is a `customNormalizationRules` entry or a lower restrict mode, then clearing the pattern file.
+The in-memory pattern set is hard-capped at **50,000 patterns** and **32 MiB total**, and a single pattern longer than **8 KB** is never stored. Beyond any limit, dedup keeps working for the patterns already known, and new shapes simply always alert (fail open — nothing is ever silently suppressed by the limits). The byte cap is the actual RAM guarantee: no matter how long individual patterns get, the dedup set can never grow past the process memory limit. A warning is logged once when the set passes 10,000 patterns: that usually means normalization is missing a variable token type and the fix is a `customNormalizationRules` entry or a lower restrict mode, then clearing the pattern file.
+
+### Alert-path bounds
+
+Two per-line bounds keep a single message from ever hurting the process; neither touches the output file, which always receives the full message:
+
+- **8 KB alert truncation** — normalization, dedup fingerprinting, and the Telegram queue see at most the first 8 KB of a message (cut on a UTF-8 boundary). Telegram itself cuts messages around 4 KB, and an error identifies itself in its first lines, so nothing of alerting value is lost — while a huge Kafka record (up to ~1 MB) can no longer cost a megabyte of regex scanning or pin megabytes per queue slot.
+- **100 ms regex match timeout** — every normalizer regex (built-in and custom) carries a match timeout. The engine is backtracking (`regexp2`); without the timeout, a pathologically shaped line — or a custom rule with nested quantifiers like `(\w+)+x` — could make one match run effectively forever, pinning that partition's CPU core with no recovery. On timeout the line skips dedup and its alert is always sent (fail open), logged with a ~30 s throttle.
 
 ### Resetting suppressed patterns
 
@@ -308,7 +315,8 @@ Memory is bounded by design, regardless of how the binary is launched (the limit
 - **Kafka outage** → idle, no messages flow, RAM flat. On recovery the backlog is skipped, so there is no catch-up surge.
 - **Slow Kafka** → consumes at the broker's pace; the backlog waits on the broker, not in the app. RAM flat.
 - **Slow / full Telegram** → the 1000-event alert queue drops on overflow (never blocks); log writing is unaffected.
-- **Per-process memory** → bounded by sarama's fetch buffers plus the size-capped batch per partition, and the in-memory dedup set is hard-capped (see below). The binary applies a **built-in `GOMEMLIMIT` of 112 MiB** when none is set in the environment, so the GC discipline holds even on a bare run; the systemd unit sets the same value explicitly plus a `MemoryMax=128M` cgroup hard cap. Running the bare binary keeps every code-level bound — it only loses the kernel-enforced cap and auto-restart.
+- **Huge or pathological log lines** → the alert path works on at most the first 8 KB of a message, and every normalizer regex has a 100 ms match timeout (see [Alert-path bounds](#alert-path-bounds)). The output file still gets the full message.
+- **Per-process memory** → bounded by sarama's fetch buffers plus the size-capped batch per partition, and the in-memory dedup set is hard-capped in count and bytes (see below). The binary applies a **built-in `GOMEMLIMIT` of 112 MiB** when none is set in the environment, so the GC discipline holds even on a bare run; the systemd unit sets the same value explicitly plus a `MemoryMax=128M` cgroup hard cap. Running the bare binary keeps every code-level bound — it only loses the kernel-enforced cap and auto-restart.
 - **Bug containment** → a panic while processing one partition is recovered and logged; that consumer reconnects and every other topic keeps running. The process does not die.
 
 ### Failure policy
@@ -326,7 +334,8 @@ Memory is bounded by design, regardless of how the binary is launched (the limit
 | Telegram unreachable (startup or while running) | Alert sending disabled; logged once + occasional reminder; re-enables automatically when Telegram answers again |
 | Telegram slow, queue full, or persistently rate-limited | Excess alerts dropped (logged); log writing unaffected |
 | Bug/panic while processing a partition | Recovered and logged; that consumer reconnects; the process and all other topics keep running |
-| Pattern set hits the 50,000 cap | Known patterns keep deduping; new shapes always alert; logged once |
+| Pattern set hits the 50,000-count or 32 MiB cap | Known patterns keep deduping; new shapes always alert; logged once |
+| Regex match times out on a pathological line (100 ms cap) | That line skips dedup, its alert is always sent; throttled log; consumption unaffected |
 
 ---
 

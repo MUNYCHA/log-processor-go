@@ -165,6 +165,48 @@ func TestPatternCapBoundsMemory(t *testing.T) {
 	}
 }
 
+// TestPatternByteCapBoundsMemory: the byte cap is the actual RAM guarantee —
+// few-but-long patterns must freeze learning just like many-but-short ones.
+// At the cap, existing patterns keep deduping and dedup stays enabled.
+func TestPatternByteCapBoundsMemory(t *testing.T) {
+	origCap := maxPatternSetBytes
+	maxPatternSetBytes = 40
+	t.Cleanup(func() { maxPatternSetBytes = origCap })
+
+	file := filepath.Join(t.TempDir(), "patterns.txt")
+	if err := os.WriteFile(file, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := NewAlertPatternStore(file)
+
+	long := strings.Repeat("x", 30)
+	if !s.Add(long) {
+		t.Fatal("add below the byte cap must succeed")
+	}
+	if s.Add(strings.Repeat("y", 30)) {
+		t.Error("add that would exceed the byte cap must be refused")
+	}
+	if s.Disabled() {
+		t.Error("hitting the byte cap must not disable dedup")
+	}
+	if !s.IsKnown(long) {
+		t.Error("existing patterns must keep deduping at the byte cap")
+	}
+
+	// Loading respects the same budget: only lines within it are kept.
+	content := strings.Repeat("a", 30) + "\n" + strings.Repeat("b", 30) + "\n"
+	if err := os.WriteFile(file, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s2 := NewAlertPatternStore(file)
+	if !s2.IsKnown(strings.Repeat("a", 30)) {
+		t.Error("patterns within the byte budget must load")
+	}
+	if s2.IsKnown(strings.Repeat("b", 30)) {
+		t.Error("patterns beyond the byte budget must not load")
+	}
+}
+
 // TestLoadTolerantOfBadLines: one oversized line in the file must not break
 // loading — the good patterns still load and dedup stays enabled.
 func TestLoadTolerantOfBadLines(t *testing.T) {

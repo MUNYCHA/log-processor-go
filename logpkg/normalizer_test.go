@@ -1,6 +1,20 @@
 package logpkg
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+// normalize fails the test on a normalization error (a regex timeout, which
+// none of these well-formed inputs should ever trigger).
+func normalize(t *testing.T, n *LogMessageNormalizer, in string) string {
+	t.Helper()
+	got, err := n.NormalizeMessage(in)
+	if err != nil {
+		t.Fatalf("NormalizeMessage(%q) unexpected error: %v", in, err)
+	}
+	return got
+}
 
 // TestNormalizeHighMode pins the structural pattern produced for every token
 // category in the default (high) restrict mode. A change in any expectation
@@ -68,7 +82,7 @@ func TestNormalizeHighMode(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := n.NormalizeMessage(c.in); got != c.want {
+			if got := normalize(t, n, c.in); got != c.want {
 				t.Errorf("NormalizeMessage(%q)\n got:  %q\n want: %q", c.in, got, c.want)
 			}
 		})
@@ -81,13 +95,13 @@ func TestNormalizeHighMode(t *testing.T) {
 func TestNormalizeSameStructureSameFingerprint(t *testing.T) {
 	n := NewLogMessageNormalizer(nil, High, nil)
 
-	a := n.NormalizeMessage("FATAL: could not connect to 10.0.0.1:5432 after 30s retries=3")
-	b := n.NormalizeMessage("FATAL: could not connect to 192.168.7.9:6543 after 45s retries=9")
+	a := normalize(t, n, "FATAL: could not connect to 10.0.0.1:5432 after 30s retries=3")
+	b := normalize(t, n, "FATAL: could not connect to 192.168.7.9:6543 after 45s retries=9")
 	if a != b {
 		t.Errorf("same structure produced different patterns:\n%q\n%q", a, b)
 	}
 
-	c := n.NormalizeMessage("FATAL: disk full on /var/lib/data")
+	c := normalize(t, n, "FATAL: disk full on /var/lib/data")
 	if a == c {
 		t.Errorf("different structure collapsed into one pattern: %q", a)
 	}
@@ -105,7 +119,7 @@ func TestNormalizeMediumMode(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := n.NormalizeMessage(c.in); got != c.want {
+			if got := normalize(t, n, c.in); got != c.want {
 				t.Errorf("NormalizeMessage(%q)\n got:  %q\n want: %q", c.in, got, c.want)
 			}
 		})
@@ -124,7 +138,7 @@ func TestNormalizeLowMode(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := n.NormalizeMessage(c.in); got != c.want {
+			if got := normalize(t, n, c.in); got != c.want {
 				t.Errorf("NormalizeMessage(%q)\n got:  %q\n want: %q", c.in, got, c.want)
 			}
 		})
@@ -135,9 +149,23 @@ func TestNormalizeCustomRulesRunFirst(t *testing.T) {
 	rules := []NormalizerRule{NewNormalizerRule(`worker-\d+`, "<WORKER>")}
 	n := NewLogMessageNormalizer(rules, High, nil)
 
-	got := n.NormalizeMessage("worker-42 crashed")
+	got := normalize(t, n, "worker-42 crashed")
 	if want := "<WORKER> crashed"; got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestNormalizeTimesOutInsteadOfHanging: a rule with catastrophic backtracking
+// (nested quantifiers that fail at the end) must return an error within the
+// match timeout instead of pinning the goroutine's CPU core indefinitely.
+// Without the timeout, this input would take ~2^63 backtracking attempts.
+func TestNormalizeTimesOutInsteadOfHanging(t *testing.T) {
+	rules := []NormalizerRule{NewNormalizerRule(`(a+)+b`, "<X>")}
+	n := NewLogMessageNormalizer(rules, High, nil)
+
+	in := "ERROR " + strings.Repeat("a", 64) + "c"
+	if _, err := n.NormalizeMessage(in); err == nil {
+		t.Fatal("catastrophic backtracking must surface as an error, not hang")
 	}
 }
 

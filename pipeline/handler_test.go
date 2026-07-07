@@ -120,3 +120,65 @@ func TestProcessAlertStoreDisabledSendsEverything(t *testing.T) {
 		}
 	}
 }
+
+// TestProcessAlertTruncatesHugeMessages: the alert path must cap the message
+// so a huge Kafka record can't pin megabytes in the Telegram queue or feed
+// megabytes through the normalizer regexes. The cut must not split a rune.
+func TestProcessAlertTruncatesHugeMessages(t *testing.T) {
+	h := newHandler([]string{"FATAL"}, nil)
+
+	// A multi-byte rune straddling the cut boundary must be dropped whole.
+	big := "FATAL: payload " + strings.Repeat("é", maxAlertMessageLen)
+	ev := &logpkg.LogEvent{Message: big}
+	out := h.ProcessAlert(ev)
+	if out == nil {
+		t.Fatal("oversized alert must still be sent")
+	}
+	if len(out.Message) > maxAlertMessageLen {
+		t.Errorf("queued message is %d bytes, cap is %d", len(out.Message), maxAlertMessageLen)
+	}
+	if !strings.HasPrefix(out.Message, "FATAL: payload ") {
+		t.Errorf("truncation must keep the head of the message, got %q…", out.Message[:32])
+	}
+	for _, r := range out.Message {
+		if r == '�' {
+			t.Fatal("truncation split a multi-byte rune")
+		}
+	}
+
+	small := &logpkg.LogEvent{Message: "FATAL: short"}
+	if got := h.ProcessAlert(small); got == nil || got.Message != "FATAL: short" {
+		t.Error("messages under the cap must pass through untouched")
+	}
+}
+
+// TestProcessAlertNormalizationTimeoutFailsOpen: when a regex times out on a
+// pathological line (here forced via a catastrophic custom rule), the alert
+// must be sent — every time — rather than suppressed, and nothing may be
+// stored in the pattern file.
+func TestProcessAlertNormalizationTimeoutFailsOpen(t *testing.T) {
+	patternFile := filepath.Join(t.TempDir(), "patterns.txt")
+	if err := os.WriteFile(patternFile, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	store := logpkg.NewAlertPatternStore(patternFile)
+	rules := []logpkg.NormalizerRule{logpkg.NewNormalizerRule(`(a+)+b`, "<X>")}
+	h := NewLogHandler(
+		logpkg.NewAlertDetector([]string{"FATAL"}),
+		logpkg.NewLogMessageNormalizer(rules, logpkg.High, nil),
+		store,
+	)
+
+	ev := &logpkg.LogEvent{Message: "FATAL " + strings.Repeat("a", 64) + "c"}
+	for i := 0; i < 2; i++ {
+		if h.ProcessAlert(ev) == nil {
+			t.Fatal("alert must be sent when normalization times out (fail open)")
+		}
+	}
+	if h.patternStore.Disabled() {
+		t.Error("a normalization timeout must not disable the store")
+	}
+	if b, _ := os.ReadFile(patternFile); len(b) != 0 {
+		t.Errorf("no pattern may be stored for a timed-out line, file has %q", b)
+	}
+}

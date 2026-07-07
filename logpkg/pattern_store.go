@@ -31,12 +31,18 @@ const (
 	scanBufLen = 1 << 20
 )
 
-// maxPatterns caps the in-memory dedup set so RAM stays bounded for the life
-// of the process even if normalization misses a variable token and patterns
-// keep accumulating. At the cap, known patterns still dedup but new ones are
-// not stored — their alerts are always sent (fail open). A var so tests can
-// lower it.
-var maxPatterns = 50_000
+// maxPatterns and maxPatternSetBytes cap the in-memory dedup set so RAM stays
+// bounded for the life of the process even if normalization misses a variable
+// token and patterns keep accumulating. The byte cap is the real memory
+// guarantee: 50k patterns at the 8 KB per-pattern limit would be ~400 MB —
+// far past the process's ~112 MiB memory limit — while 32 MiB can never
+// endanger it. Whichever cap is hit first freezes learning: known patterns
+// still dedup, new ones are not stored — their alerts are always sent (fail
+// open). Vars so tests can lower them.
+var (
+	maxPatterns        = 50_000
+	maxPatternSetBytes = 32 << 20 // 32 MiB
+)
 
 // recoverProbeInterval is how often a disabled store re-checks whether the
 // pattern file is back. dirPollInterval is how often a vanished parent
@@ -50,6 +56,7 @@ type AlertPatternStore struct {
 	patternFile string
 	mu          sync.RWMutex
 	known       map[string]struct{}
+	knownBytes  int // total bytes of patterns in known, checked against maxPatternSetBytes
 	disabled    atomic.Bool
 
 	// stateMu guards the status-page fields below. It is separate from mu
@@ -139,14 +146,16 @@ func NewAlertPatternStore(patternFile string) *AlertPatternStore {
 
 // readPatterns reads the pattern file into a fresh set, skipping blank,
 // oversized, and beyond-cap lines so one bad line can never poison loading.
-func (s *AlertPatternStore) readPatterns() (map[string]struct{}, error) {
+// The returned size is the total bytes of the kept patterns.
+func (s *AlertPatternStore) readPatterns() (map[string]struct{}, int, error) {
 	f, err := os.Open(s.patternFile)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer f.Close()
 
 	next := make(map[string]struct{})
+	size := 0
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), scanBufLen)
 	for sc.Scan() {
@@ -154,31 +163,35 @@ func (s *AlertPatternStore) readPatterns() (map[string]struct{}, error) {
 		if line == "" || len(line) > maxPatternLen {
 			continue
 		}
-		if len(next) >= maxPatterns {
+		if len(next) >= maxPatterns || size+len(line) > maxPatternSetBytes {
 			break
 		}
-		next[line] = struct{}{}
+		if _, ok := next[line]; !ok {
+			next[line] = struct{}{}
+			size += len(line)
+		}
 	}
 	if err := sc.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return next, nil
+	return next, size, nil
 }
 
 func (s *AlertPatternStore) load() error {
-	next, err := s.readPatterns()
+	next, size, err := s.readPatterns()
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	s.known = next
+	s.knownBytes = size
 	s.mu.Unlock()
 	slog.Info("loaded patterns", "count", len(next), "file", s.patternFile)
 	return nil
 }
 
 func (s *AlertPatternStore) reload() {
-	next, err := s.readPatterns()
+	next, size, err := s.readPatterns()
 	if err != nil {
 		slog.Warn("reload failed, keeping previous patterns", "error", err)
 		return
@@ -188,6 +201,7 @@ func (s *AlertPatternStore) reload() {
 	same := mapsEqual(s.known, next)
 	if !same {
 		s.known = next
+		s.knownBytes = size
 	}
 	s.mu.Unlock()
 
@@ -220,13 +234,13 @@ func (s *AlertPatternStore) Add(pattern string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Hard cap: keep RAM bounded for the life of the process. Existing
-	// patterns still suppress; new ones alert every time.
-	if len(s.known) >= maxPatterns {
+	// Hard caps (count and total bytes): keep RAM bounded for the life of the
+	// process. Existing patterns still suppress; new ones alert every time.
+	if len(s.known) >= maxPatterns || s.knownBytes+len(pattern) > maxPatternSetBytes {
 		if s.capWarned.CompareAndSwap(false, true) {
 			slog.Error("pattern cap reached — new patterns no longer stored, their alerts always sent; "+
 				"normalization is likely missing a variable token type",
-				"cap", maxPatterns, "file", s.patternFile)
+				"count", len(s.known), "bytes", s.knownBytes, "file", s.patternFile)
 		}
 		return false
 	}
@@ -246,6 +260,7 @@ func (s *AlertPatternStore) Add(pattern string) bool {
 	}
 
 	s.known[pattern] = struct{}{}
+	s.knownBytes += len(pattern)
 
 	if len(s.known) >= warnThreshold && s.growthWarned.CompareAndSwap(false, true) {
 		slog.Warn("patterns accumulated — normalization may be missing a variable token type",
@@ -310,6 +325,7 @@ func (s *AlertPatternStore) runWatchLoop() error {
 			if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
 				s.mu.Lock()
 				s.known = make(map[string]struct{})
+				s.knownBytes = 0
 				s.mu.Unlock()
 				slog.Info("pattern file deleted — cleared all patterns")
 			} else if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
